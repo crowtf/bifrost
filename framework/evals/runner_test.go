@@ -206,7 +206,11 @@ func (s *memoryJobStore) StartJob(_ context.Context, id, keyID string, claim Job
 	if _, done := s.results[id]; done || s.routed[id] != keyID {
 		return false, nil
 	}
-	if _, started := s.started[id]; started && s.claims[id] != claim.DeliveryID && !s.startedAt[id].Before(claim.StartedBefore) {
+	_, started := s.started[id]
+	if !claim.RecoverStartedAt.IsZero() && (!started || s.claims[id] != claim.DeliveryID || !s.startedAt[id].Equal(claim.RecoverStartedAt)) {
+		return false, nil
+	}
+	if started && s.claims[id] != claim.DeliveryID && !s.startedAt[id].Before(claim.StartedBefore) {
 		return false, nil
 	}
 	s.started[id], s.claims[id], s.startedAt[id] = keyID, claim.DeliveryID, time.Now()
@@ -313,8 +317,18 @@ func newRunnerHarness(t *testing.T, keys []EvalKey, hold time.Duration) *runnerH
 // newRunnerHarnessOn is newRunnerHarness over any JobStore. Its store field is nil.
 func newRunnerHarnessOn(t *testing.T, keys []EvalKey, hold time.Duration, store JobStore) *runnerHarness {
 	t.Helper()
-	q, err := queue.NewQueue(context.Background(), &queue.Config{Enabled: true, Type: queue.QueueTypeMemory}, queue.Dependencies{}, nil)
+	return newRunnerHarnessWith(t, keys, hold, store, nil)
+}
+
+// newRunnerHarnessWith is newRunnerHarnessOn with the runner's queue wrapped by wrap.
+func newRunnerHarnessWith(t *testing.T, keys []EvalKey, hold time.Duration, store JobStore, wrap func(queue.Queue) queue.Queue) *runnerHarness {
+	t.Helper()
+	inner, err := queue.NewQueue(context.Background(), &queue.Config{Enabled: true, Type: queue.QueueTypeMemory}, queue.Dependencies{}, nil)
 	require.NoError(t, err)
+	q := inner
+	if wrap != nil {
+		q = wrap(inner)
+	}
 
 	tracker := newKeyTracker()
 	gate := &atomic.Pointer[chan struct{}]{}
@@ -807,12 +821,13 @@ func TestRunner_EndsAStartedJobWhoseKeyIsGone(t *testing.T) {
 	assert.Contains(t, result.Reasoning, "enabled for evaluations")
 }
 
-// gatedQueue holds every Subscribe to one topic until two callers are inside, and
-// counts the subscriptions to it that are still open.
+// gatedQueue holds every Subscribe to one topic until release is closed, signalling
+// arrived as each caller enters, and counts the subscriptions to it that are still open.
 type gatedQueue struct {
 	queue.Queue
 	topic   string
 	arrived chan struct{}
+	release chan struct{}
 	open    atomic.Int32
 }
 
@@ -832,11 +847,7 @@ func (q *gatedQueue) Subscribe(ctx context.Context, topic, group string, handler
 		return q.Queue.Subscribe(ctx, topic, group, handler, opts...)
 	}
 	q.arrived <- struct{}{}
-	select {
-	case <-time.After(300 * time.Millisecond): // the other caller never came: no race to force
-	case q.arrived <- struct{}{}:
-	case <-q.arrived:
-	}
+	<-q.release
 	sub, err := q.Queue.Subscribe(ctx, topic, group, handler, opts...)
 	if err != nil {
 		return nil, err
@@ -851,11 +862,14 @@ func (q *gatedQueue) Subscribe(ctx context.Context, topic, group string, handler
 func TestRunner_ConcurrentSubscribesLeaveOneConsumer(t *testing.T) {
 	inner, err := queue.NewQueue(context.Background(), &queue.Config{Enabled: true, Type: queue.QueueTypeMemory}, queue.Dependencies{}, nil)
 	require.NoError(t, err)
-	q := &gatedQueue{Queue: inner, topic: keyTopic("key-new"), arrived: make(chan struct{}, 1)}
+	q := &gatedQueue{Queue: inner, topic: keyTopic("key-new"), arrived: make(chan struct{}, 2), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(q.release) }) }
 	engine := NewEngine(EngineOptions{})
 	runner := NewRunner(q, engine, func(context.Context) ([]EvalKey, error) { return nil, nil }, newMemoryJobStore(), RunnerOptions{PollInterval: 5 * time.Millisecond, SyncInterval: time.Hour})
 	require.NoError(t, runner.Start(context.Background()))
 	t.Cleanup(func() {
+		release()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = runner.Close(ctx)
@@ -871,6 +885,18 @@ func TestRunner_ConcurrentSubscribesLeaveOneConsumer(t *testing.T) {
 			assert.NoError(t, runner.ensureSubscribed(context.Background(), key, false))
 		}()
 	}
+	// Both callers must be inside Subscribe at once, or the race is not exercised.
+	deadline := time.After(5 * time.Second)
+	for i := range 2 {
+		select {
+		case <-q.arrived:
+		case <-deadline:
+			release()
+			wg.Wait()
+			t.Fatalf("only %d of 2 subscribe attempts arrived", i)
+		}
+	}
+	release()
 	wg.Wait()
 	assert.EqualValues(t, 1, q.open.Load(), "one consumer on the key's topic")
 }
@@ -1034,9 +1060,32 @@ func TestRunner_ResumesUnfinishedJobsOnAQueueThatForgets(t *testing.T) {
 	store.mu.Unlock()
 }
 
+// countingQueue counts the messages published for one job.
+type countingQueue struct {
+	queue.Queue
+	jobID     string
+	published atomic.Int32
+}
+
+func (q *countingQueue) Publish(ctx context.Context, messages ...*queue.Message) error {
+	for _, message := range messages {
+		var payload jobMessage
+		if json.Unmarshal(message.Payload, &payload) == nil && payload.JobID == q.jobID {
+			q.published.Add(1)
+		}
+	}
+	return q.Queue.Publish(ctx, messages...)
+}
+
 // Two instances that both sweep must requeue a stranded job once between them.
 func TestRunner_SweepsOfTwoInstancesRequeueOnce(t *testing.T) {
-	h := newRunnerHarness(t, []EvalKey{{ID: "key-a", Provider: "openai", Concurrency: 2, Supports: anyModel}}, 20*time.Millisecond)
+	store := newMemoryJobStore()
+	counted := &countingQueue{jobID: "stranded"}
+	h := newRunnerHarnessWith(t, []EvalKey{{ID: "key-a", Provider: "openai", Concurrency: 2, Supports: anyModel}}, 20*time.Millisecond, store, func(q queue.Queue) queue.Queue {
+		counted.Queue = q
+		return counted
+	})
+	h.store = store
 	h.store.addStranded(aiJob("stranded", "openai", "gpt-4o-mini"), "key-gone", time.Hour)
 
 	var wg sync.WaitGroup
@@ -1053,6 +1102,7 @@ func TestRunner_SweepsOfTwoInstancesRequeueOnce(t *testing.T) {
 
 	_, runs := h.tracker.snapshot()
 	assert.Equal(t, 1, runs["key-a"], "the job ran once")
+	assert.EqualValues(t, 1, counted.published.Load(), "the stranded job was published once")
 }
 
 // failingRouteStore fails every RouteJob of one job, as a store that cannot write that
@@ -1101,21 +1151,6 @@ func TestRunner_SweepEndsAStartedJobOnARemovedKey(t *testing.T) {
 	assert.Contains(t, result.Reasoning, "no longer enabled for evaluations")
 }
 
-// A job on a removed key that started recently may still have a live owner, so the
-// sweep leaves it running.
-func TestRunner_SweepLeavesARecentlyStartedJobOnARemovedKey(t *testing.T) {
-	h := newRunnerHarness(t, []EvalKey{{ID: "key-a", Provider: "openai", Concurrency: 1, Supports: anyModel}}, 0)
-	h.store.addStranded(aiJob("fresh", "openai", "gpt-4o-mini"), "key-gone", 2*time.Hour)
-	h.store.mu.Lock()
-	h.store.started["fresh"], h.store.claims["fresh"], h.store.startedAt["fresh"] = "key-gone", "owner", time.Now()
-	h.store.mu.Unlock()
-
-	require.NoError(t, h.runner.Sweep(context.Background()))
-	_, done := h.store.result("fresh")
-	assert.False(t, done, "a job whose claim may still be live is not ended")
-	assert.Equal(t, "key-gone", h.store.routedTo("fresh"), "a started job is not moved")
-}
-
 // A job restarted since the sweep listed it belongs to the delivery that restarted it,
 // so the sweep's claim fails and the job is left to that delivery.
 func TestRunner_SweepLeavesAStartedJobThatWasRestarted(t *testing.T) {
@@ -1133,6 +1168,53 @@ func TestRunner_SweepLeavesAStartedJobThatWasRestarted(t *testing.T) {
 	require.NoError(t, h.runner.endLostJob(context.Background(), job))
 	_, done := h.store.result("restarted")
 	assert.False(t, done, "a job another delivery restarted is not ended")
+}
+
+// restartingStore restarts a job right after StaleJobs lists it, under the same delivery
+// with a later start time: the queue redelivered the message that started it.
+type restartingStore struct {
+	*memoryJobStore
+	id string
+}
+
+func (s *restartingStore) StaleJobs(ctx context.Context, queuedBefore, routedBefore time.Time, skipKeys []string, after JobCursor, limit int) ([]*Job, JobCursor, error) {
+	jobs, next, err := s.memoryJobStore.StaleJobs(ctx, queuedBefore, routedBefore, skipKeys, after, limit)
+	s.mu.Lock()
+	s.startedAt[s.id] = time.Now()
+	s.mu.Unlock()
+	return jobs, next, err
+}
+
+// A job the same delivery restarted after the sweep listed it is a new start: the sweep's
+// claim names the start it listed, so it fails, and the job is left to the redelivery.
+func TestRunner_SweepLeavesAJobTheSameDeliveryRestarted(t *testing.T) {
+	inner := newMemoryJobStore()
+	store := &restartingStore{memoryJobStore: inner, id: "redelivered"}
+	h := newRunnerHarnessOn(t, []EvalKey{{ID: "key-a", Provider: "openai", Concurrency: 1, Supports: anyModel}}, 0, store)
+	h.store = inner
+	inner.addStranded(aiJob("redelivered", "openai", "gpt-4o-mini"), "key-gone", 2*time.Hour)
+	inner.mu.Lock()
+	inner.started["redelivered"], inner.claims["redelivered"], inner.startedAt["redelivered"] = "key-gone", "same-delivery", time.Now().Add(-2*time.Hour)
+	inner.mu.Unlock()
+
+	require.NoError(t, h.runner.Sweep(context.Background()))
+	_, done := inner.result("redelivered")
+	assert.False(t, done, "the restarted job is left running")
+}
+
+// A job on a removed key that started recently may still have a live owner, so the
+// sweep leaves it running.
+func TestRunner_SweepLeavesARecentlyStartedJobOnARemovedKey(t *testing.T) {
+	h := newRunnerHarness(t, []EvalKey{{ID: "key-a", Provider: "openai", Concurrency: 1, Supports: anyModel}}, 0)
+	h.store.addStranded(aiJob("fresh", "openai", "gpt-4o-mini"), "key-gone", 2*time.Hour)
+	h.store.mu.Lock()
+	h.store.started["fresh"], h.store.claims["fresh"], h.store.startedAt["fresh"] = "key-gone", "owner", time.Now()
+	h.store.mu.Unlock()
+
+	require.NoError(t, h.runner.Sweep(context.Background()))
+	_, done := h.store.result("fresh")
+	assert.False(t, done, "a job whose claim may still be live is not ended")
+	assert.Equal(t, "key-gone", h.store.routedTo("fresh"), "a started job is not moved")
 }
 
 // A message for a job that already completed is acknowledged without running it again.
@@ -1243,7 +1325,7 @@ func TestRunner_RetriesAFailedResume(t *testing.T) {
 	store := newMemoryJobStore()
 	store.addStranded(aiJob("orphan", "openai", "gpt-4o-mini"), "key-gone", time.Hour)
 	store.markStarted("orphan", "key-gone")
-	store.failWrite["orphan"] = 1
+	store.failWrite["orphan"] = len(completeWriteBackoff) + 1 // every try of the one write
 	runner, _ := volatileRunner(t, store, []EvalKey{{ID: "key-a", Provider: "openai", Concurrency: 1, Supports: anyModel}})
 	_, done := store.result("orphan")
 	require.False(t, done, "the first write failed")
@@ -1429,7 +1511,7 @@ func TestRunner_DeadLetteredJobEndsWithAnError(t *testing.T) {
 	h := newRunnerHarness(t, nil, 0)
 	job := programmaticJob("dead")
 	h.store.mu.Lock()
-	h.store.failWrite["dead"] = defaultRunnerMaxAttempts
+	h.store.failWrite["dead"] = defaultRunnerMaxAttempts * (len(completeWriteBackoff) + 1) // every try of every attempt
 	h.store.mu.Unlock()
 	h.submit(t, job)
 	require.Eventually(t, func() bool { _, done := h.store.result("dead"); return done }, 30*time.Second, 20*time.Millisecond, "the job never ended")

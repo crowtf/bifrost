@@ -43,9 +43,10 @@ func (f *fakeExecutionStore) GetEvalExecution(_ context.Context, id string) (*ta
 
 // StartEvalExecution claims the way the SQL store does: only on the key the execution is
 // on, and only a queued one, one running under the same delivery, or one running since
-// before reclaimStartedBefore. It never moves the execution to another key. A row with
+// before reclaimStartedBefore; a recovery claim (recoverStartedAt set) takes only the run
+// that started at that instant under that delivery. It never moves the execution to another key. A row with
 // no status stands for a queued one, as CreateEvalExecution stores it.
-func (f *fakeExecutionStore) StartEvalExecution(_ context.Context, id, keyID, claimID string, reclaimStartedBefore time.Time) (bool, error) {
+func (f *fakeExecutionStore) StartEvalExecution(_ context.Context, id, keyID, claimID string, reclaimStartedBefore, recoverStartedAt time.Time) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	row, ok := f.rows[id]
@@ -54,6 +55,10 @@ func (f *fakeExecutionStore) StartEvalExecution(_ context.Context, id, keyID, cl
 	}
 	queued := row.Status == "" || row.Status == tables.EvalExecutionQueued
 	reclaimed := row.Status == tables.EvalExecutionRunning && (row.ClaimID == claimID || (row.StartedAt != nil && row.StartedAt.Before(reclaimStartedBefore)))
+	if !recoverStartedAt.IsZero() {
+		queued = false
+		reclaimed = row.Status == tables.EvalExecutionRunning && row.ClaimID == claimID && row.StartedAt != nil && row.StartedAt.Equal(recoverStartedAt)
+	}
 	if !queued && !reclaimed {
 		return false, nil
 	}
