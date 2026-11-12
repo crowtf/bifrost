@@ -467,6 +467,7 @@ type TraceStore interface {
 	ClearTraceDirty(ctx context.Context, trace DirtyTrace) error
 	CreateTraceSpanLinks(ctx context.Context, links []*TraceSpanLink) error
 	ListTraceSpanLinks(ctx context.Context, projectID, traceID string) ([]*TraceSpanLink, error)
+	DeleteTraceSpanLinks(ctx context.Context, projectID, traceID, spanID string) error
 	FindTraceSpanLinksByLog(ctx context.Context, logKind string, logIDs []string) ([]*TraceSpanLink, error)
 	UpsertTraceScores(ctx context.Context, scores []*TraceScore) error
 	ListTraceScores(ctx context.Context, projectID, traceID string) ([]*TraceScore, error)
@@ -484,8 +485,19 @@ type TraceStore interface {
 	CompleteTraceUploadRow(ctx context.Context, upload *TraceUpload) error
 	ReadTraceUploadBytes(ctx context.Context, id string) (*TraceUpload, []byte, error)
 	DeleteTraces(ctx context.Context, keys []TraceKey) error
+	// UpdateTraceSpanEnrichment writes what the matcher and the cost resolver add to a span.
+	UpdateTraceSpanEnrichment(ctx context.Context, projectID, traceID, spanID string, enrichment TraceSpanEnrichment) error
+	// Gateway rows a span can be linked to.
+	FindGatewayCallsByTraceID(ctx context.Context, traceID string) ([]*GatewayCall, error)
+	FindGatewayCallsByProviderResponseIDs(ctx context.Context, ids []string) ([]*GatewayCall, error)
+	FindGatewayCallsByFingerprint(ctx context.Context, fingerprint string, from, to time.Time, virtualKeyIDs []string) ([]*GatewayCall, error)
+	FindGatewayCallChain(ctx context.Context, logKind string, ids []string) ([]*GatewayCall, error)
 	DeleteExpiredTraceRowsBatch(ctx context.Context, now time.Time, batchSize int) (int64, error)
 }
+
+// MaxFingerprintCandidates caps the gateway rows a fingerprint lookup returns. A full page means
+// the caller cannot tell a fit is unique.
+const MaxFingerprintCandidates = 50
 
 // TraceSpanKey names one span inside a project.
 type TraceSpanKey struct {
@@ -777,6 +789,21 @@ func buildTraceRollup(projectID, traceID string, spans []*TraceSpan, scores []*T
 	var lastEnd, expires *time.Time
 	var cost, estimated float64
 	priced, keptForever := false, false
+	// A wrapper span and its child can both report one provider response id: that is one call, so
+	// its tokens and cost count once, on the span holding the gateway snapshot when there is one.
+	// Distinct provider calls never share a response id.
+	var countedBy map[string]*TraceSpan
+	for _, span := range spans {
+		if span.ProviderResponseID == "" || (!countsTokens(span.Kind) && span.LinkSnapshotParsed == nil) {
+			continue
+		}
+		if countedBy == nil {
+			countedBy = make(map[string]*TraceSpan)
+		}
+		if current := countedBy[span.ProviderResponseID]; current == nil || (current.LinkSnapshotParsed == nil && span.LinkSnapshotParsed != nil) {
+			countedBy[span.ProviderResponseID] = span
+		}
+	}
 	for _, span := range spans {
 		if root == nil && span.ParentSpanID == "" {
 			root = span
@@ -822,6 +849,9 @@ func buildTraceRollup(projectID, traceID string, spans []*TraceSpan, scores []*T
 			continue
 		}
 		trace.LLMSpanCount++
+		if span.ProviderResponseID != "" && countedBy[span.ProviderResponseID] != span {
+			continue // the same call is counted on another span
+		}
 		tokens, spanCost := span.TotalTokens, span.Cost
 		if linked != nil {
 			tokens, spanCost = linked.TotalTokens, linked.Cost
@@ -1004,6 +1034,12 @@ func (s *RDBLogStore) ListTraceSpanLinks(ctx context.Context, projectID, traceID
 		return nil, err
 	}
 	return links, nil
+}
+
+// DeleteTraceSpanLinks removes every link of one span, before a stronger match replaces them.
+func (s *RDBLogStore) DeleteTraceSpanLinks(ctx context.Context, projectID, traceID, spanID string) error {
+	_, err := s.traceDelete(ctx, "trace_span_links", "project_id = ? AND trace_id = ? AND span_id = ?", projectID, traceID, spanID)
+	return err
 }
 
 // FindTraceSpanLinksByLog returns the links that point at the given gateway rows.
@@ -1500,4 +1536,238 @@ func (s *RDBLogStore) deleteEmptyExpiredTraces(ctx context.Context, now time.Tim
 		}
 	}
 	return deleted, nil
+}
+
+// TraceSpanEnrichment is what Bifrost adds to a span after the fold: the gateway link and a cost
+// estimate. It is written as a column update, never as a rewrite of the span, so it cannot undo a
+// part folded in the meantime. A nil field is left as stored.
+type TraceSpanEnrichment struct {
+	LinkMethod       *string
+	LinkSnapshot     *TraceLinkSnapshot
+	LinkedLogExpired *bool
+	Cost             *float64
+	CostEstimated    *bool
+	Provider         *string
+	PricedFrom       *TraceSpanPricingInputs // the usage an estimated cost was computed from
+}
+
+// TraceSpanPricingInputs is the part of a span an estimated cost is computed from. An estimate
+// belongs to these values and is stale once any of them changes.
+type TraceSpanPricingInputs struct {
+	Model             string
+	Provider          string
+	PromptTokens      int
+	CompletionTokens  int
+	TotalTokens       int
+	CachedReadTokens  int
+	CachedWriteTokens int
+}
+
+// TraceSpanPricingInputsOf reads the pricing inputs of a span.
+func TraceSpanPricingInputsOf(span *TraceSpan) TraceSpanPricingInputs {
+	return TraceSpanPricingInputs{
+		Model: span.Model, Provider: span.Provider, PromptTokens: span.PromptTokens, CompletionTokens: span.CompletionTokens,
+		TotalTokens: span.TotalTokens, CachedReadTokens: span.CachedReadTokens, CachedWriteTokens: span.CachedWriteTokens,
+	}
+}
+
+// ErrTraceSpanChanged reports that an estimated cost was not written because the span's pricing
+// inputs or cost changed after the caller read it. The caller prices the span again.
+var ErrTraceSpanChanged = errors.New("trace span changed since it was priced")
+
+// UpdateTraceSpanEnrichment writes the given enrichment fields onto one span. An estimated cost
+// (CostEstimated true) is a fallback: it and the provider it names are written only while the span
+// has no cost, so an SDK cost committed after the caller read the span is never replaced. With
+// PricedFrom set, it is also written only while the span still has those pricing inputs; otherwise
+// nothing of the estimate is written and ErrTraceSpanChanged is returned after the other fields.
+func (s *RDBLogStore) UpdateTraceSpanEnrichment(ctx context.Context, projectID, traceID, spanID string, enrichment TraceSpanEnrichment) error {
+	estimate := enrichment.CostEstimated != nil && *enrichment.CostEstimated
+	var changed error
+	if estimate && !s.replacesOnInsert() {
+		fallback := map[string]any{"cost_estimated": true, "updated_at": time.Now().UTC()}
+		if enrichment.Cost != nil {
+			fallback["cost"] = *enrichment.Cost
+		}
+		if enrichment.Provider != nil {
+			fallback["provider"] = *enrichment.Provider
+		}
+		query := s.db.WithContext(ctx).Model(&TraceSpan{}).
+			Where("project_id = ? AND trace_id = ? AND span_id = ? AND cost IS NULL", projectID, traceID, spanID)
+		if from := enrichment.PricedFrom; from != nil {
+			query = query.Where("model = ? AND provider = ? AND prompt_tokens = ? AND completion_tokens = ? AND total_tokens = ? AND cached_read_tokens = ? AND cached_write_tokens = ?",
+				from.Model, from.Provider, from.PromptTokens, from.CompletionTokens, from.TotalTokens, from.CachedReadTokens, from.CachedWriteTokens)
+		}
+		result := query.Updates(fallback)
+		if result.Error != nil {
+			return result.Error
+		}
+		if enrichment.PricedFrom != nil && result.RowsAffected == 0 {
+			changed = ErrTraceSpanChanged
+		}
+		enrichment.Cost, enrichment.CostEstimated, enrichment.Provider = nil, nil, nil
+	}
+	updates := map[string]any{}
+	if enrichment.LinkMethod != nil {
+		updates["link_method"] = *enrichment.LinkMethod
+	}
+	if enrichment.LinkSnapshot != nil {
+		data, err := schemas.MarshalSorted(enrichment.LinkSnapshot)
+		if err != nil {
+			return fmt.Errorf("failed to serialize trace link snapshot: %w", err)
+		}
+		updates["link_snapshot"] = string(data)
+	}
+	if enrichment.LinkedLogExpired != nil {
+		updates["linked_log_expired"] = *enrichment.LinkedLogExpired
+	}
+	if enrichment.Cost != nil {
+		updates["cost"] = *enrichment.Cost
+	}
+	if enrichment.CostEstimated != nil {
+		updates["cost_estimated"] = *enrichment.CostEstimated
+	}
+	if enrichment.Provider != nil {
+		updates["provider"] = *enrichment.Provider
+	}
+	if len(updates) == 0 {
+		return changed
+	}
+	db := s.db.WithContext(ctx)
+	if !s.replacesOnInsert() {
+		updates["updated_at"] = time.Now().UTC()
+		if err := db.Model(&TraceSpan{}).Where("project_id = ? AND trace_id = ? AND span_id = ?", projectID, traceID, spanID).Updates(updates).Error; err != nil {
+			return err
+		}
+		return changed
+	}
+	// ClickHouse has no column update that is cheap: read the row, patch it, insert it again.
+	found, err := s.FindTraceSpans(ctx, projectID, []TraceSpanKey{{TraceID: traceID, SpanID: spanID}})
+	if err != nil || len(found) == 0 {
+		return err
+	}
+	span := found[0]
+	if estimate && (span.Cost != nil || (enrichment.PricedFrom != nil && TraceSpanPricingInputsOf(span) != *enrichment.PricedFrom)) {
+		if enrichment.PricedFrom != nil {
+			changed = ErrTraceSpanChanged // the span changed after the caller priced it
+		}
+		enrichment.Cost, enrichment.CostEstimated, enrichment.Provider = nil, nil, nil // an estimate never replaces a cost
+		if enrichment.LinkMethod == nil && enrichment.LinkSnapshot == nil && enrichment.LinkedLogExpired == nil {
+			return changed // nothing else to write
+		}
+	}
+	if enrichment.LinkMethod != nil {
+		span.LinkMethod = *enrichment.LinkMethod
+	}
+	if enrichment.LinkSnapshot != nil {
+		span.LinkSnapshotParsed = enrichment.LinkSnapshot
+	}
+	if enrichment.LinkedLogExpired != nil {
+		span.LinkedLogExpired = *enrichment.LinkedLogExpired
+	}
+	if enrichment.Cost != nil {
+		span.Cost = enrichment.Cost
+	}
+	if enrichment.CostEstimated != nil {
+		span.CostEstimated = *enrichment.CostEstimated
+	}
+	if enrichment.Provider != nil {
+		span.Provider = *enrichment.Provider
+	}
+	if err := db.Create(span).Error; err != nil {
+		return err
+	}
+	return changed
+}
+
+// GatewayCall is the part of a gateway LLM or MCP row the trace matcher reads.
+type GatewayCall struct {
+	LogKind            string    `json:"log_kind"` // llm | mcp
+	ID                 string    `json:"id"`
+	ParentRequestID    *string   `json:"parent_request_id,omitempty"`
+	Timestamp          time.Time `json:"timestamp"`
+	Provider           string    `json:"provider,omitempty"`
+	Model              string    `json:"model,omitempty"` // the tool name for an MCP row
+	Status             string    `json:"status"`
+	TraceID            *string   `json:"trace_id,omitempty"`
+	ParentSpanID       *string   `json:"parent_span_id,omitempty"`
+	ProviderResponseID *string   `json:"provider_response_id,omitempty"`
+	InputFingerprint   *string   `json:"input_fingerprint,omitempty"`
+	VirtualKeyID       *string   `json:"virtual_key_id,omitempty"`
+	PromptTokens       int       `json:"prompt_tokens"`
+	CompletionTokens   int       `json:"completion_tokens"`
+	TotalTokens        int       `json:"total_tokens"`
+	CachedReadTokens   int       `json:"cached_read_tokens"`
+	Cost               *float64  `json:"cost,omitempty"`
+	Latency            *float64  `json:"latency,omitempty"`
+}
+
+const (
+	gatewayLLMCallColumns = "'llm' AS log_kind, id, parent_request_id, timestamp, provider, model, status, trace_id, parent_span_id, provider_response_id, input_fingerprint, virtual_key_id, prompt_tokens, completion_tokens, total_tokens, cached_read_tokens, cost, latency"
+	gatewayMCPCallColumns = "'mcp' AS log_kind, id, timestamp, tool_name AS model, status, trace_id, parent_span_id, virtual_key_id, cost, latency"
+	// gatewayCallLimit bounds one matcher lookup. A trace with more gateway calls than this links
+	// the first ones and leaves the rest unlinked.
+	gatewayCallLimit = 2000
+)
+
+// FindGatewayCallsByTraceID returns the gateway LLM and MCP rows that named this trace on their
+// request, oldest first.
+func (s *RDBLogStore) FindGatewayCallsByTraceID(ctx context.Context, traceID string) ([]*GatewayCall, error) {
+	if traceID == "" {
+		return nil, nil
+	}
+	var calls []*GatewayCall
+	if err := s.db.WithContext(ctx).Table("logs").Select(gatewayLLMCallColumns).Where("trace_id = ?", traceID).Order("timestamp ASC").Limit(gatewayCallLimit).Scan(&calls).Error; err != nil {
+		return nil, err
+	}
+	var tools []*GatewayCall
+	if err := s.db.WithContext(ctx).Table("mcp_tool_logs").Select(gatewayMCPCallColumns).Where("trace_id = ?", traceID).Order("timestamp ASC").Limit(gatewayCallLimit).Scan(&tools).Error; err != nil {
+		return nil, err
+	}
+	return append(calls, tools...), nil
+}
+
+// FindGatewayCallsByProviderResponseIDs returns the gateway LLM rows whose provider gave one of
+// these response ids.
+func (s *RDBLogStore) FindGatewayCallsByProviderResponseIDs(ctx context.Context, ids []string) ([]*GatewayCall, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var calls []*GatewayCall
+	err := s.db.WithContext(ctx).Table("logs").Select(gatewayLLMCallColumns).Where("provider_response_id IN ?", ids).Limit(gatewayCallLimit).Scan(&calls).Error
+	return calls, err
+}
+
+// FindGatewayCallsByFingerprint returns the gateway LLM rows in a time window whose last user
+// message has this fingerprint, limited to the given virtual keys when any are named.
+func (s *RDBLogStore) FindGatewayCallsByFingerprint(ctx context.Context, fingerprint string, from, to time.Time, virtualKeyIDs []string) ([]*GatewayCall, error) {
+	if fingerprint == "" {
+		return nil, nil
+	}
+	dialect := s.db.Dialector.Name()
+	fromPlaceholder, fromArg := timestampBound(dialect, from, lowerTimeBound)
+	toPlaceholder, toArg := timestampBound(dialect, to, upperTimeBound)
+	query := s.db.WithContext(ctx).Table("logs").Select(gatewayLLMCallColumns).
+		Where("timestamp >= "+fromPlaceholder+" AND timestamp <= "+toPlaceholder+" AND input_fingerprint = ?", fromArg, toArg, fingerprint)
+	if len(virtualKeyIDs) > 0 {
+		query = query.Where("virtual_key_id IN ?", virtualKeyIDs)
+	}
+	var calls []*GatewayCall
+	err := query.Order("timestamp ASC").Limit(MaxFingerprintCandidates).Scan(&calls).Error
+	return calls, err
+}
+
+// FindGatewayCallChain returns the given gateway rows together with the fallback and retry
+// attempts that hang off them, which name the first attempt as their parent request.
+func (s *RDBLogStore) FindGatewayCallChain(ctx context.Context, logKind string, ids []string) ([]*GatewayCall, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var calls []*GatewayCall
+	if logKind == TraceLinkedLogKindMCP {
+		err := s.db.WithContext(ctx).Table("mcp_tool_logs").Select(gatewayMCPCallColumns).Where("id IN ?", ids).Limit(gatewayCallLimit).Scan(&calls).Error
+		return calls, err
+	}
+	err := s.db.WithContext(ctx).Table("logs").Select(gatewayLLMCallColumns).
+		Where("id IN ? OR parent_request_id IN ?", ids, ids).Order("timestamp ASC").Limit(gatewayCallLimit).Scan(&calls).Error
+	return calls, err
 }

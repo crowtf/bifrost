@@ -175,6 +175,39 @@ func TestRecomputeTraceRollupCountsEachCallOnce(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
+// TestRecomputeTraceRollupCountsOneResponseIDOnce pins that a wrapper span and its child reporting
+// the same provider response id are one call: its tokens and cost count once, from the linked
+// span's snapshot when one of them is linked, and once with no gateway at all.
+func TestRecomputeTraceRollupCountsOneResponseIDOnce(t *testing.T) {
+	ctx := context.Background()
+	store := newTraceTestStore(t)
+	start := time.Now().UTC().Truncate(time.Millisecond)
+	end := start.Add(time.Second)
+	require.NoError(t, store.UpsertTraceSpans(ctx, []*TraceSpan{
+		{ProjectID: "p1", TraceID: "linked", SpanID: "a", Kind: TraceSpanKindLLM, Source: TraceSourceOTel, StartTime: start, EndTime: &end, ProviderResponseID: "resp-1",
+			TotalTokens: 100, LinkMethod: "header", LinkSnapshotParsed: &TraceLinkSnapshot{TotalTokens: 100, PromptTokens: 60, CompletionTokens: 40, Cost: new(0.01)}},
+		{ProjectID: "p1", TraceID: "linked", SpanID: "b", ParentSpanIDsParsed: []string{"a"}, Kind: TraceSpanKindLLM, Source: TraceSourceOTel, StartTime: start, EndTime: &end,
+			ProviderResponseID: "resp-1", TotalTokens: 100, PromptTokens: 60, CompletionTokens: 40, Cost: new(0.02)},
+		{ProjectID: "p1", TraceID: "bare", SpanID: "a", Kind: TraceSpanKindLLM, Source: TraceSourceOTel, StartTime: start, EndTime: &end, ProviderResponseID: "resp-2", TotalTokens: 70, Cost: new(0.03)},
+		{ProjectID: "p1", TraceID: "bare", SpanID: "b", ParentSpanIDsParsed: []string{"a"}, Kind: TraceSpanKindLLM, Source: TraceSourceOTel, StartTime: start, EndTime: &end, ProviderResponseID: "resp-2", TotalTokens: 70, Cost: new(0.03)},
+		{ProjectID: "p1", TraceID: "bare", SpanID: "c", ParentSpanIDsParsed: []string{"a"}, Kind: TraceSpanKindLLM, Source: TraceSourceOTel, StartTime: start, EndTime: &end, ProviderResponseID: "resp-3", TotalTokens: 5},
+	}))
+
+	trace, err := store.RecomputeTraceRollup(ctx, "p1", "linked")
+	require.NoError(t, err)
+	assert.Equal(t, 100, trace.TotalTokens, "the call is counted once, from the gateway snapshot")
+	assert.Equal(t, 60, trace.PromptTokens)
+	require.NotNil(t, trace.Cost)
+	assert.InDelta(t, 0.01, *trace.Cost, 1e-9)
+
+	trace, err = store.RecomputeTraceRollup(ctx, "p1", "bare")
+	require.NoError(t, err)
+	assert.Equal(t, 75, trace.TotalTokens, "resp-2 counts once; a different response id is a separate call")
+	require.NotNil(t, trace.Cost)
+	assert.InDelta(t, 0.03, *trace.Cost, 1e-9)
+	assert.Equal(t, 1, trace.UnpricedSpanCount)
+}
+
 // TestRecomputeTraceRollupListsTraceBeforeItsRoot pins the rootless case. OTel exports only
 // finished spans, so children land before the root: the trace is listed at once, marked in
 // progress, and completes when the root arrives.
@@ -264,6 +297,14 @@ func TestTraceSpanLinksAreStoredOncePerGatewayRow(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, byLog, 1)
 	assert.Equal(t, "s1", byLog[0].SpanID)
+
+	// Deleting one span's links leaves every other span's.
+	require.NoError(t, store.CreateTraceSpanLinks(ctx, []*TraceSpanLink{{ProjectID: "p1", TraceID: "t1", SpanID: "s2", LogKind: TraceLinkedLogKindLLM, LogID: "log-3", Method: "fingerprint"}}))
+	require.NoError(t, store.DeleteTraceSpanLinks(ctx, "p1", "t1", "s1"))
+	links, err = store.ListTraceSpanLinks(ctx, "p1", "t1")
+	require.NoError(t, err)
+	require.Len(t, links, 1)
+	assert.Equal(t, "s2", links[0].SpanID)
 }
 
 // TestTraceScoresFeedTheRollup pins scores: a score written again under the same id replaces the
@@ -863,4 +904,53 @@ func TestTraceUploadBytesLiveOnTheRowWithoutAnObjectStore(t *testing.T) {
 	assert.Equal(t, []byte("png"), data)
 	assert.Equal(t, TraceUploadStatusDone, upload.Status)
 	assert.ErrorIs(t, store.SaveTraceUploadBytes(ctx, "missing", []byte("x")), ErrNotFound)
+}
+
+// An estimated cost is a fallback: it is written only where the span has no cost. A span whose SDK
+// cost was committed after the enrichment read keeps that cost.
+func TestEstimatedCostNeverReplacesAStoredCost(t *testing.T) {
+	ctx := context.Background()
+	store := newTraceTestStore(t)
+	require.NoError(t, store.UpsertTraceSpans(ctx, []*TraceSpan{{ProjectID: "p1", TraceID: "t", SpanID: "sdk", Source: TraceSourceOTel, StartTime: time.Now(), Cost: new(0.5), Provider: "anthropic"}}))
+	require.NoError(t, store.UpsertTraceSpans(ctx, []*TraceSpan{{ProjectID: "p1", TraceID: "t", SpanID: "bare", Source: TraceSourceOTel, StartTime: time.Now()}}))
+
+	estimate := TraceSpanEnrichment{Cost: new(9.0), CostEstimated: new(true), Provider: new("openai")}
+	for _, span := range []string{"sdk", "bare"} {
+		require.NoError(t, store.UpdateTraceSpanEnrichment(ctx, "p1", "t", span, estimate))
+	}
+	found, err := store.FindTraceSpans(ctx, "p1", []TraceSpanKey{{TraceID: "t", SpanID: "sdk"}, {TraceID: "t", SpanID: "bare"}})
+	require.NoError(t, err)
+	byID := map[string]*TraceSpan{}
+	for _, span := range found {
+		byID[span.SpanID] = span
+	}
+	require.NotNil(t, byID["sdk"].Cost)
+	assert.Equal(t, 0.5, *byID["sdk"].Cost, "the SDK's cost stays")
+	assert.False(t, byID["sdk"].CostEstimated)
+	assert.Equal(t, "anthropic", byID["sdk"].Provider)
+	require.NotNil(t, byID["bare"].Cost)
+	assert.Equal(t, 9.0, *byID["bare"].Cost, "a span with no cost gets the estimate")
+	assert.True(t, byID["bare"].CostEstimated)
+}
+
+// An estimate prices the usage it was read with. A span whose usage changed after that read is not
+// given the stale price: the write reports that the span changed, so the caller prices it again.
+func TestEstimatedCostIsWrittenOnlyForTheUsageItPriced(t *testing.T) {
+	ctx := context.Background()
+	store := newTraceTestStore(t)
+	require.NoError(t, store.UpsertTraceSpans(ctx, []*TraceSpan{{ProjectID: "p1", TraceID: "t", SpanID: "llm", Kind: TraceSpanKindLLM, Source: TraceSourceOTel, StartTime: time.Now(), Model: "gpt-4o", TotalTokens: 100}}))
+
+	stale := TraceSpanEnrichment{Cost: new(0.1), CostEstimated: new(true), PricedFrom: &TraceSpanPricingInputs{Model: "gpt-4o", TotalTokens: 10}}
+	require.ErrorIs(t, store.UpdateTraceSpanEnrichment(ctx, "p1", "t", "llm", stale), ErrTraceSpanChanged)
+	found, err := store.FindTraceSpans(ctx, "p1", []TraceSpanKey{{TraceID: "t", SpanID: "llm"}})
+	require.NoError(t, err)
+	require.Len(t, found, 1)
+	assert.Nil(t, found[0].Cost, "a price for other usage is not written")
+
+	current := TraceSpanEnrichment{Cost: new(1.0), CostEstimated: new(true), PricedFrom: new(TraceSpanPricingInputsOf(found[0]))}
+	require.NoError(t, store.UpdateTraceSpanEnrichment(ctx, "p1", "t", "llm", current))
+	found, err = store.FindTraceSpans(ctx, "p1", []TraceSpanKey{{TraceID: "t", SpanID: "llm"}})
+	require.NoError(t, err)
+	require.NotNil(t, found[0].Cost)
+	assert.Equal(t, 1.0, *found[0].Cost)
 }
